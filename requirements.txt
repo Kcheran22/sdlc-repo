@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+openai
+langgraph
+langchain
+python-dotenv
+databricks-sql-connector
