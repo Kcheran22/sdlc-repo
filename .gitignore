@@ -1,0 +1,65 @@
+# ===============================
+# 🔐 ENV & SECRETS
+# ===============================
+.env
+.env.*
+*.env
+
+# ===============================
+# 🐍 PYTHON
+# ===============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python build files
+build/
+dist/
+*.egg-info/
+
+# ===============================
+# 🧪 TEST / CACHE
+# ===============================
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+# ===============================
+# 📝 LOGS
+# ===============================
+*.log
+
+# ===============================
+# 💻 IDE / EDITOR
+# ===============================
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ===============================
+# 📁 PROJECT FILES
+# ===============================
+projects/     # your uploaded files folder
+
+# ===============================
+# ⚛️ FRONTEND (React / Vite)
+# ===============================
+node_modules/
+dist/
+build/
+.cache/
+
+# ===============================
+# 🔧 OS FILES
+# ===============================
+Thumbs.db
+.DS_Store
