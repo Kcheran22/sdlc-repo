@@ -8,3 +8,5 @@ langchain
 python-dotenv
 databricks-sql-connector
 starlette
+pdfplumber==0.11.4
+httpx==0.28.1
