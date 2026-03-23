@@ -12,7 +12,41 @@ from graph import graph
 
 # 🔥 Initialize FastAPI
 app = FastAPI(title="Planner Agent API")
+from fastapi.openapi.utils import get_openapi
 
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version="1.0.0",
+        description="Fixed file upload schema",
+        routes=app.routes,
+    )
+
+    try:
+        # 🔥 FIX THE ACTUAL COMPONENT SCHEMA
+        body_schema = schema["components"]["schemas"]["Body_upload_to_project_upload_to_project__post"]
+
+        body_schema["properties"]["files"] = {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "format": "binary"   # ✅ THIS FIXES SWAGGER
+            }
+        }
+
+    except Exception as e:
+        print("Schema fix error:", e)
+
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
+
+ 
 # 🔹 Temporary in-memory store (replace with DB later)
 PROJECTS = {}
 
@@ -49,7 +83,7 @@ def create_project(project_name: str):
 async def upload_to_project(
     project_id: str = Form(...),
     text_input: Optional[str] = Form(None),
-    files: List[UploadFile] = File(default=[])
+    files: List[UploadFile] = File(None)   # 🔥 MULTIPLE FILE SUPPORT
 ):
     try:
         # 🔹 Validate project
@@ -60,21 +94,40 @@ async def upload_to_project(
         folder = get_project_folder(project_name)
 
         file_paths = []
+        all_text = text_input or ""
 
-        # 🔹 Save files
-        for file in files:
-            path = save_file(file, folder)
-            file_paths.append(path)
+        # 🔥 Process uploaded files
+        if files:
+            for file in files:
+                path = save_file(file, folder)
+                file_paths.append(path)
+
+                # 🎙️ Audio → Transcription
+                if file.content_type and file.content_type.startswith("audio"):
+                    from services.transcription_service import transcribe_audio
+                    transcript = transcribe_audio(path)
+                    all_text += "\n" + transcript
+
+                # 📄 Text files → Read content
+                elif file.content_type and file.content_type.startswith("text"):
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        all_text += "\n" + f.read()
+
+                # 📦 Other files (PDF, DOC, etc.)
+                else:
+                    all_text += f"\n[FILE: {file.filename}]"
 
         # 🔹 Prepare LangGraph state
         state = {
             "project_id": project_id,
             "project_name": project_name,
-            "text_input": text_input or "",
+            "text_input": all_text,
             "file_paths": file_paths,
             "transcripts": [],
             "combined_text": "",
-            "cleaned_output": ""
+            "cleaned_output": "",
+            "brd": "",
+            "frd": ""
         }
 
         # 🔥 Run LangGraph pipeline
@@ -83,7 +136,9 @@ async def upload_to_project(
         return {
             "project_id": project_id,
             "project_name": project_name,
-            "cleaned_requirement": result["cleaned_output"]
+            "cleaned_requirement": result.get("cleaned_output"),
+            "brd": result.get("brd"),
+            "frd": result.get("frd")
         }
 
     except Exception as e:
@@ -91,7 +146,7 @@ async def upload_to_project(
 
 
 # ===============================
-# ✅ 3. HEALTH CHECK (Optional)
+# ✅ 3. HEALTH CHECK
 # ===============================
 @app.get("/")
 def health_check():

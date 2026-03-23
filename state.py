@@ -8,3 +8,5 @@ class PlannerState(TypedDict):
     transcripts: List[str]
     combined_text: str
     cleaned_output: str
+    brd: str
+    frd: str

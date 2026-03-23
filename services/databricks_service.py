@@ -2,10 +2,13 @@ from databricks import sql
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
+# 🔥 Load environment variables
 load_dotenv()
 
 
+# ===============================
+# 🔹 CONNECTION
+# ===============================
 def get_connection():
     """
     Create Databricks SQL Warehouse connection
@@ -17,7 +20,16 @@ def get_connection():
     )
 
 
-def save_to_databricks(project_id: str, project_name: str, cleaned_requirement: str):
+# ===============================
+# 🔹 INSERT DATA
+# ===============================
+def save_to_databricks(
+    project_id: str,
+    project_name: str,
+    cleaned_requirement: str,
+    brd: str,
+    frd: str
+):
     """
     Insert project data into Databricks table
     """
@@ -28,33 +40,56 @@ def save_to_databricks(project_id: str, project_name: str, cleaned_requirement: 
 
     full_table_name = f"{catalog}.{schema}.{table}"
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    connection = None
+    cursor = None
 
     try:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        # 🔥 Ensure no None values
+        cleaned_requirement = cleaned_requirement or ""
+        brd = brd or ""
+        frd = frd or ""
+
         query = f"""
         INSERT INTO {full_table_name}
-        (project_id, project_name, cleaned_requirement)
-        VALUES (?, ?, ?)
+        (project_id, project_name, cleaned_requirement, brd, frd)
+        VALUES (?, ?, ?, ?, ?)
         """
 
-        cursor.execute(query, (project_id, project_name, cleaned_requirement))
+        values = (
+            project_id,
+            project_name,
+            cleaned_requirement,
+            brd,
+            frd
+        )
+
+        print("🧪 DEBUG INSERT VALUES:", values)
+
+        cursor.execute(query, values)
         connection.commit()
 
         print("✅ Data inserted successfully into Databricks")
 
     except Exception as e:
         print("❌ Error inserting data:", str(e))
-        raise e
+        raise Exception(f"Databricks Insert Failed: {str(e)}")
 
     finally:
-        cursor.close()
-        connection.close()
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
+# ===============================
+# 🔹 FETCH DATA
+# ===============================
 def fetch_projects():
     """
-    Fetch all projects (optional API use)
+    Fetch all projects from Databricks
     """
 
     catalog = os.getenv("DATABRICKS_CATALOG")
@@ -63,29 +98,40 @@ def fetch_projects():
 
     full_table_name = f"{catalog}.{schema}.{table}"
 
-    connection = get_connection()
-    cursor = connection.cursor()
+    connection = None
+    cursor = None
 
     try:
-        query = f"SELECT * FROM {full_table_name}"
-        cursor.execute(query)
+        connection = get_connection()
+        cursor = connection.cursor()
 
+        query = f"""
+        SELECT project_id, project_name, cleaned_requirement, brd, frd
+        FROM {full_table_name}
+        """
+
+        cursor.execute(query)
         rows = cursor.fetchall()
 
         results = []
+
         for row in rows:
             results.append({
                 "project_id": row[0],
                 "project_name": row[1],
-                "cleaned_requirement": row[2]
+                "cleaned_requirement": row[2],
+                "brd": row[3],
+                "frd": row[4]
             })
 
         return results
 
     except Exception as e:
         print("❌ Error fetching data:", str(e))
-        raise e
+        raise Exception(f"Databricks Fetch Failed: {str(e)}")
 
     finally:
-        cursor.close()
-        connection.close()
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
