@@ -1,273 +1,269 @@
+# ============================================================
+# app.py  —  FastAPI entry point for the SDLC Planner Agent
+# ============================================================
+
+# ── Standard library ─────────────────────────────────────────────────────────
 import io
 import json
 import logging
-import os
 import uuid
-from typing import Optional, List
+from typing import List, Optional
 
+# ── Third-party ──────────────────────────────────────────────────────────────
 import pdfplumber
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 
-from utils.file_utils import (
-    create_project_folder,
-    get_project_folder,
-    save_file
+# ── Internal ─────────────────────────────────────────────────────────────────
+from pipeline import pipeline
+from state import PlannerState
+from services.databricks_service import fetch_brd_frd_by_project_id
+from utils.file_utils import create_project_folder, get_project_folder, save_file
+
+# ── Bootstrap ────────────────────────────────────────────────────────────────
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="SDLC Planner Agent API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-from graph import graph
-
-# 🔥 Initialize FastAPI
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-app = FastAPI(title="Planner Agent API")
-from fastapi.openapi.utils import get_openapi
+# ── In-memory project store (replace with DB in production) ──────────────────
+PROJECTS: dict = {}
 
 
-def _extract_text(file_bytes: bytes, filename: str) -> str:
-    if not filename:
-        return ""
-    
-    filename_lower = filename.lower()
-    
-    if filename_lower.endswith(".pdf"):
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
-            
-    elif filename_lower.endswith(".docx"):
-        import docx
-        doc = docx.Document(io.BytesIO(file_bytes))
-        return "\n".join(paragraph.text for paragraph in doc.paragraphs)
-        
-    return file_bytes.decode("utf-8", errors="replace")
-
-
-def _run_agent(brd: str, frd: str, task_assignment: Optional[dict]) -> dict:
-    initial_state = {
-        "project_id": "temp-project",
-        "project_name": "Epic Generation",
-        "text_input": "",
-        "file_paths": [],
-        "transcripts": [],
-        "combined_text": "",
-        "cleaned_output": "",
-        "brd": brd,
-        "frd": frd,
-        "brd_content": brd,
-        "frd_content": frd,
-        "task_assignment": task_assignment,
-        "requirements": None,
-        "epics": None,
-        "stories_with_ac": None,
-        "review_output": None,
-        "current_step": "start",
-        "step_outputs": [],
-        "error": None,
-    }
-    result = graph.invoke(initial_state)
-    if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
-    return result
-
-
+# ── Swagger / OpenAPI fix for multi-file upload ───────────────────────────────
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
-
-    schema = get_openapi(
-        title=app.title,
-        version="1.0.0",
-        description="Fixed file upload schema",
-        routes=app.routes,
-    )
-
+    schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
     try:
-        # 🔥 FIX THE ACTUAL COMPONENT SCHEMA
-        body_schema = schema["components"]["schemas"]["Body_upload_to_project_upload_to_project__post"]
-
-        body_schema["properties"]["files"] = {
+        body = schema["components"]["schemas"]["Body_upload_to_project_upload_to_project__post"]
+        body["properties"]["files"] = {
             "type": "array",
-            "items": {
-                "type": "string",
-                "format": "binary"   # ✅ THIS FIXES SWAGGER
-            }
+            "items": {"type": "string", "format": "binary"},
         }
-
-    except Exception as e:
-        print("Schema fix error:", e)
-
+    except KeyError:
+        pass
     app.openapi_schema = schema
     return schema
 
-
 app.openapi = custom_openapi
 
- 
-# 🔹 Temporary in-memory store (replace with DB later)
-PROJECTS = {}
+
+# ── Helper utilities ──────────────────────────────────────────────────────────
+
+def _extract_text(file_bytes: bytes, filename: str) -> str:
+    """Extract plain text from PDF, DOCX, or raw text bytes."""
+    if not filename:
+        return ""
+    name = filename.lower()
+    if name.endswith(".pdf"):
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+    if name.endswith(".docx"):
+        import docx
+        doc = docx.Document(io.BytesIO(file_bytes))
+        return "\n".join(p.text for p in doc.paragraphs)
+    return file_bytes.decode("utf-8", errors="replace")
 
 
-# ===============================
-# ✅ 1. CREATE PROJECT
-# ===============================
-@app.post("/create-project/")
+def _run_epic_agent(brd: str, frd: str, task_assignment: Optional[dict]) -> PlannerState:
+    """Build a PlannerState from BRD/FRD text and run the epic generation pipeline."""
+    state = PlannerState(
+        brd=brd,
+        frd=frd,
+        brd_content=brd,
+        frd_content=frd,
+        task_assignment=task_assignment,
+    )
+    result = pipeline.run_epic_generation(state)
+    if result.error:
+        raise HTTPException(status_code=500, detail=result.error)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE 1 — Health check
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/", tags=["Health"])
+def health_check():
+    return {"status": "SDLC Planner API is running 🚀"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE 2 — Create project
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/create-project/", tags=["Project"])
 def create_project(project_name: str):
+    """Create a new project and return its project_id."""
     try:
-        project_id = str(uuid.uuid4())
-
-        folder_path = create_project_folder(project_name)
-
-        PROJECTS[project_id] = {
-            "project_name": project_name,
-            "folder_path": folder_path
-        }
-
+        project_id   = str(uuid.uuid4())
+        folder_path  = create_project_folder(project_name)
+        PROJECTS[project_id] = {"project_name": project_name, "folder_path": folder_path}
         return {
-            "project_id": project_id,
+            "project_id":   project_id,
             "project_name": project_name,
-            "message": "Project created successfully"
+            "message":      "Project created successfully",
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===============================
-# ✅ 2. UPLOAD + PROCESS
-# ===============================
-@app.post("/upload-to-project/")
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE 3 — Upload files → clean → generate BRD/FRD → store in Databricks
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/upload-to-project/", tags=["Project"])
 async def upload_to_project(
     project_id: str = Form(...),
     text_input: Optional[str] = Form(None),
-    files: List[UploadFile] = File(None)   # 🔥 MULTIPLE FILE SUPPORT
+    files: List[UploadFile] = File(None),
 ):
+    """
+    Upload raw text or files (audio/text/PDF/DOCX) to a project.
+    Runs: collect → transcribe → merge → clean → BRD → FRD → Databricks store.
+    Does NOT run epic/story generation.
+    """
     try:
-        # 🔹 Validate project
         if project_id not in PROJECTS:
             raise HTTPException(status_code=400, detail="Invalid project_id")
 
         project_name = PROJECTS[project_id]["project_name"]
-        folder = get_project_folder(project_name)
+        folder       = get_project_folder(project_name)
+        file_paths   = []
+        all_text     = text_input or ""
 
-        file_paths = []
-        all_text = text_input or ""
-
-        # 🔥 Process uploaded files
         if files:
             for file in files:
                 path = save_file(file, folder)
                 file_paths.append(path)
 
-                # 🎙️ Audio → Transcription
                 if file.content_type and file.content_type.startswith("audio"):
                     from services.transcription_service import transcribe_audio
-                    transcript = transcribe_audio(path)
-                    all_text += "\n" + transcript
-
-                # 📄 Text files → Read content
+                    all_text += "\n" + transcribe_audio(path)
                 elif file.content_type and file.content_type.startswith("text"):
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         all_text += "\n" + f.read()
-
-                # 📦 Other files (PDF, DOC, etc.)
                 else:
                     all_text += f"\n[FILE: {file.filename}]"
 
-        # 🔹 Prepare LangGraph state
-        state = {
-            "project_id": project_id,
-            "project_name": project_name,
-            "text_input": all_text,
-            "file_paths": file_paths,
-            "transcripts": [],
-            "combined_text": "",
-            "cleaned_output": "",
-            "brd": "",
-            "frd": ""
-        }
-
-        # 🔥 Run LangGraph pipeline
-        result = graph.invoke(state)
+        state  = PlannerState(
+            project_id=project_id,
+            project_name=project_name,
+            text_input=all_text,
+            file_paths=file_paths,
+        )
+        result = pipeline.run_upload(state)
 
         return {
-            "project_id": project_id,
-            "project_name": project_name,
-            "cleaned_requirement": result.get("cleaned_output"),
-            "brd": result.get("brd"),
-            "frd": result.get("frd")
+            "project_id":          project_id,
+            "project_name":        project_name,
+            "cleaned_requirement": result.cleaned_output,
+            "brd":                 result.brd,
+            "frd":                 result.frd,
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
- 
 
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "service": "SDLC Planner — Epic & Story Generator"}
-
-
-class TextGenerateRequest(BaseModel):
-    brd_content: Optional[str] = ""
-    frd_content: Optional[str] = ""
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE 4 — Generate epics & stories from raw BRD/FRD text
+# ─────────────────────────────────────────────────────────────────────────────
+class EpicGenerateRequest(BaseModel):
+    brd_content:     Optional[str] = ""
+    frd_content:     Optional[str] = ""
     task_assignment: Optional[dict] = None
 
 
-@app.post("/api/generate")
-async def generate_from_text(body: TextGenerateRequest):
+@app.post("/api/generate-epics-stories", tags=["Epic & Story Generation"])
+async def generate_from_text(body: EpicGenerateRequest):
     """
     Generate epics & stories from raw BRD/FRD text.
 
-    Pass `task_assignment` to hint the ownership model, e.g.:
-    ```json
-    { "development": "Agent", "testing": "Human", "deployment": "Human" }
-    ```
+    Pass `task_assignment` to hint ownership, e.g.:
+    `{ "development": "Agent", "testing": "Human", "deployment": "Human" }`
     """
-    result = _run_agent(body.brd_content, body.frd_content, body.task_assignment)
+    result = _run_epic_agent(body.brd_content, body.frd_content, body.task_assignment)
     return {
-        "success": True,
-        "data": result["review_output"],
-        "step_outputs": result.get("step_outputs", []),
+        "success":      True,
+        "data":         result.review_output,
+        "step_outputs": result.step_outputs,
     }
 
 
-@app.post("/api/generate-from-files")
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE 5 — Generate epics & stories from uploaded BRD/FRD files
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/api/generate-epics-stories-from-files", tags=["Epic & Story Generation"])
 async def generate_from_files(
-    brd_file: Optional[UploadFile] = File(None, description="BRD document (.pdf or .txt)"),
-    frd_file: Optional[UploadFile] = File(None, description="FRD document (.pdf or .txt)"),
-    task_assignment: Optional[str] = Form(
-        None, description='JSON string, e.g. {"development":"Agent"}'
-    ),
+    brd_file:        Optional[UploadFile] = File(None, description="BRD document (.pdf / .docx / .txt)"),
+    frd_file:        Optional[UploadFile] = File(None, description="FRD document (.pdf / .docx / .txt)"),
+    task_assignment: Optional[str]        = Form(None, description='JSON e.g. {"development":"Agent"}'),
 ):
-    """Generate epics & stories from uploaded BRD / FRD files (PDF or TXT)."""
+    """Generate epics & stories from uploaded BRD / FRD files."""
     brd_text = ""
     if brd_file and brd_file.filename:
-        brd_bytes = await brd_file.read()
-        brd_text = _extract_text(brd_bytes, brd_file.filename)
-        
+        brd_text = _extract_text(await brd_file.read(), brd_file.filename)
+
     frd_text = ""
     if frd_file and frd_file.filename:
-        frd_bytes = await frd_file.read()
-        frd_text = _extract_text(frd_bytes, frd_file.filename)
+        frd_text = _extract_text(await frd_file.read(), frd_file.filename)
 
     task_assign_dict = json.loads(task_assignment) if task_assignment else None
+    result           = _run_epic_agent(brd_text, frd_text, task_assign_dict)
 
-    result = _run_agent(brd_text, frd_text, task_assign_dict)
     return {
-        "success": True,
-        "data": result["review_output"],
-        "step_outputs": result.get("step_outputs", []),
+        "success":      True,
+        "data":         result.review_output,
+        "step_outputs": result.step_outputs,
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTE 6 — Generate epics & stories from an existing Databricks project
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/api/generate-from-existing", tags=["Epic & Story Generation"])
+async def generate_from_existing(
+    project_id:      str,
+    task_assignment: Optional[dict] = None,
+):
+    """
+    Fetch BRD and FRD from the Databricks `projects` table by project_id,
+    then run the Epic & Story Generation pipeline.
+    """
+    try:
+        project_data = fetch_brd_frd_by_project_id(project_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-# ===============================
-# ✅ 3. HEALTH CHECK
-# ===============================
-@app.get("/")
-def health_check():
-    return {"status": "Planner Agent API is running 🚀"}
+    brd = project_data.get("brd", "")
+    frd = project_data.get("frd", "")
+
+    if not brd and not frd:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Project '{project_id}' found but BRD and FRD are both empty. "
+                   "Run /upload-to-project/ first to generate them.",
+        )
+
+    result = _run_epic_agent(brd, frd, task_assignment)
+
+    return {
+        "success":      True,
+        "project_id":   project_data["project_id"],
+        "project_name": project_data["project_name"],
+        "data":         result.review_output,
+        "step_outputs": result.step_outputs,
+    }

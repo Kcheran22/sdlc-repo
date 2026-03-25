@@ -135,3 +135,55 @@ def fetch_projects():
             cursor.close()
         if connection:
             connection.close()
+
+
+# ===============================
+# 🔹 FETCH BRD + FRD BY PROJECT ID
+# ===============================
+def fetch_brd_frd_by_project_id(project_id: str) -> dict:
+    """
+    Fetch BRD and FRD content for a specific project from Databricks.
+    Table: sdlc.planner_agent.project
+    """
+    catalog = os.getenv("DATABRICKS_CATALOG")
+    schema  = os.getenv("DATABRICKS_SCHEMA")
+    table   = os.getenv("DATABRICKS_TABLE")        # same table: sdlc.planner_agent.projects
+
+    full_table_name = f"{catalog}.{schema}.{table}"
+
+    connection = None
+    cursor     = None
+
+    try:
+        connection = get_connection()
+        cursor     = connection.cursor()
+
+        query = f"""
+        SELECT project_id, project_name, brd, frd
+        FROM {full_table_name}
+        WHERE project_id = ?
+        LIMIT 1
+        """
+
+        cursor.execute(query, (project_id,))
+        row = cursor.fetchone()
+
+        if row is None:
+            raise ValueError(f"No project found with project_id='{project_id}'")
+
+        return {
+            "project_id":   row[0],
+            "project_name": row[1],
+            "brd":          row[2] or "",
+            "frd":          row[3] or "",
+        }
+
+    except Exception as e:
+        print("❌ Error fetching BRD/FRD:", str(e))
+        raise Exception(f"Databricks Fetch Failed: {str(e)}")
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
